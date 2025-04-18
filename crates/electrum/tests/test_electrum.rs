@@ -5,7 +5,10 @@ use bdk_chain::{
     spk_txout::SpkTxOutIndex,
     Balance, ConfirmationBlockTime, IndexedTxGraph, Indexer, Merge, TxGraph,
 };
-use bdk_core::bitcoin::Network;
+use bdk_core::bitcoin::{
+    key::{Secp256k1, UntweakedPublicKey},
+    Network,
+};
 use bdk_electrum::BdkElectrumClient;
 use bdk_testenv::{
     anyhow,
@@ -14,11 +17,21 @@ use bdk_testenv::{
 };
 use core::time::Duration;
 use electrum_client::ElectrumApi;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 
 // Batch size for `sync_with_electrum`.
 const BATCH_SIZE: usize = 5;
+
+pub fn get_test_spk() -> ScriptBuf {
+    const PK_BYTES: &[u8] = &[
+        12, 244, 72, 4, 163, 4, 211, 81, 159, 82, 153, 123, 125, 74, 142, 40, 55, 237, 191, 231,
+        31, 114, 89, 165, 83, 141, 8, 203, 93, 240, 53, 101,
+    ];
+    let secp = Secp256k1::new();
+    let pk = UntweakedPublicKey::from_slice(PK_BYTES).expect("Must be valid PK");
+    ScriptBuf::new_p2tr(&secp, pk, None)
+}
 
 fn get_balance(
     recv_chain: &LocalChain,
@@ -60,6 +73,122 @@ where
     Ok(update)
 }
 
+// Ensure that a wallet can detect a malicious replacement of an incoming transaction.
+//
+// This checks that both the Electrum chain source and the receiving structures properly track the
+// replaced transaction as missing.
+#[test]
+pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
+    const SEND_TX_FEE: Amount = Amount::from_sat(1000);
+    const UNDO_SEND_TX_FEE: Amount = Amount::from_sat(2000);
+
+    let env = TestEnv::new()?;
+    let rpc_client = env.rpc_client();
+    let electrum_client = electrum_client::Client::new(env.electrsd.electrum_url.as_str())?;
+    let client = BdkElectrumClient::new(electrum_client);
+
+    let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(SpkTxOutIndex::<()>::default());
+    let (chain, _) = LocalChain::from_genesis_hash(env.bitcoind.client.get_block_hash(0)?);
+
+    // Get receiving address.
+    let receiver_spk = get_test_spk();
+    let receiver_addr = Address::from_script(&receiver_spk, bdk_chain::bitcoin::Network::Regtest)?;
+    graph.index.insert_spk((), receiver_spk);
+
+    env.mine_blocks(101, None)?;
+
+    // Select a UTXO to use as an input for constructing our test transactions.
+    let selected_utxo = rpc_client
+        .list_unspent(None, None, None, Some(false), None)?
+        .into_iter()
+        // Find a block reward tx.
+        .find(|utxo| utxo.amount == Amount::from_int_btc(50))
+        .expect("Must find a block reward UTXO");
+
+    // Derive the sender's address from the selected UTXO.
+    let sender_spk = selected_utxo.script_pub_key.clone();
+    let sender_addr = Address::from_script(&sender_spk, bdk_chain::bitcoin::Network::Regtest)
+        .expect("Failed to derive address from UTXO");
+
+    // Setup the common inputs used by both `send_tx` and `undo_send_tx`.
+    let inputs = [CreateRawTransactionInput {
+        txid: selected_utxo.txid,
+        vout: selected_utxo.vout,
+        sequence: None,
+    }];
+
+    // Create and sign the `send_tx` that sends funds to the receiver address.
+    let send_tx_outputs = HashMap::from([(
+        receiver_addr.to_string(),
+        selected_utxo.amount - SEND_TX_FEE,
+    )]);
+    let send_tx = rpc_client.create_raw_transaction(&inputs, &send_tx_outputs, None, Some(true))?;
+    let send_tx = rpc_client
+        .sign_raw_transaction_with_wallet(send_tx.raw_hex(), None, None)?
+        .transaction()?;
+
+    // Create and sign the `undo_send_tx` transaction. This redirects funds back to the sender
+    // address.
+    let undo_send_outputs = HashMap::from([(
+        sender_addr.to_string(),
+        selected_utxo.amount - UNDO_SEND_TX_FEE,
+    )]);
+    let undo_send_tx =
+        rpc_client.create_raw_transaction(&inputs, &undo_send_outputs, None, Some(true))?;
+    let undo_send_tx = rpc_client
+        .sign_raw_transaction_with_wallet(undo_send_tx.raw_hex(), None, None)?
+        .transaction()?;
+
+    // Sync after broadcasting the `send_tx`. Ensure that we detect and receive the `send_tx`.
+    let send_txid = env.rpc_client().send_raw_transaction(send_tx.raw_hex())?;
+    env.wait_until_electrum_sees_txid(send_txid, Duration::from_secs(6))?;
+    let sync_request = SyncRequest::builder()
+        .chain_tip(chain.tip())
+        .spks_with_indexes(graph.index.all_spks().clone())
+        .expected_spk_txids(graph.list_expected_spk_txids(&chain, chain.tip().block_id(), ..));
+    let sync_response = client.sync(sync_request, BATCH_SIZE, true)?;
+    assert!(
+        sync_response
+            .tx_update
+            .txs
+            .iter()
+            .any(|tx| tx.compute_txid() == send_txid),
+        "sync response must include the send_tx"
+    );
+    let changeset = graph.apply_update(sync_response.tx_update.clone());
+    assert!(
+        changeset.tx_graph.txs.contains(&send_tx),
+        "tx graph must deem send_tx relevant and include it"
+    );
+
+    // Sync after broadcasting the `undo_send_tx`. Verify that `send_tx` is now missing from the
+    // mempool.
+    let undo_send_txid = env
+        .rpc_client()
+        .send_raw_transaction(undo_send_tx.raw_hex())?;
+    env.wait_until_electrum_sees_txid(undo_send_txid, Duration::from_secs(6))?;
+    let sync_request = SyncRequest::builder()
+        .chain_tip(chain.tip())
+        .spks_with_indexes(graph.index.all_spks().clone())
+        .expected_spk_txids(graph.list_expected_spk_txids(&chain, chain.tip().block_id(), ..));
+    let sync_response = client.sync(sync_request, BATCH_SIZE, true)?;
+    assert!(
+        sync_response
+            .tx_update
+            .evicted_ats
+            .iter()
+            .any(|(txid, _)| *txid == send_txid),
+        "sync response must track send_tx as missing from mempool"
+    );
+    let changeset = graph.apply_update(sync_response.tx_update.clone());
+    assert!(
+        changeset.tx_graph.last_evicted.contains_key(&send_txid),
+        "tx graph must track send_tx as missing"
+    );
+
+    Ok(())
+}
+
 /// If an spk history contains a tx that spends another unconfirmed tx (chained mempool history),
 /// the Electrum API will return the tx with a negative height. This should succeed and not panic.
 #[test]
@@ -75,7 +204,7 @@ pub fn chained_mempool_tx_sync() -> anyhow::Result<()> {
     env.mine_blocks(100, None)?;
 
     // First unconfirmed tx.
-    env.send(&tracked_addr, Amount::from_btc(1.0)?)?;
+    let txid1 = env.send(&tracked_addr, Amount::from_btc(1.0)?)?;
 
     // Create second unconfirmed tx that spends the first.
     let utxo = rpc_client
@@ -100,7 +229,7 @@ pub fn chained_mempool_tx_sync() -> anyhow::Result<()> {
     let signed_tx = rpc_client
         .sign_raw_transaction_with_wallet(tx_that_spends_unconfirmed.raw_hex(), None, None)?
         .transaction()?;
-    rpc_client.send_raw_transaction(signed_tx.raw_hex())?;
+    let txid2 = rpc_client.send_raw_transaction(signed_tx.raw_hex())?;
 
     env.wait_until_electrum_sees_txid(signed_tx.compute_txid(), Duration::from_secs(5))?;
 
@@ -111,8 +240,16 @@ pub fn chained_mempool_tx_sync() -> anyhow::Result<()> {
     );
 
     let client = BdkElectrumClient::new(electrum_client);
-    let request = SyncRequest::builder().spks(core::iter::once(tracked_addr.script_pubkey()));
-    let _response = client.sync(request, 1, false)?;
+    let req = SyncRequest::builder()
+        .spks(core::iter::once(tracked_addr.script_pubkey()))
+        .build();
+    let req_time = req.start_time();
+    let response = client.sync(req, 1, false)?;
+    assert_eq!(
+        response.tx_update.seen_ats,
+        [(txid1, req_time), (txid2, req_time)].into(),
+        "both txids must have `seen_at` time match the request's `start_time`",
+    );
 
     Ok(())
 }
