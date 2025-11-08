@@ -3,7 +3,8 @@ use bdk_chain::{
     local_chain::LocalChain,
     spk_client::{FullScanRequest, SyncRequest, SyncResponse},
     spk_txout::SpkTxOutIndex,
-    Balance, ConfirmationBlockTime, IndexedTxGraph, Indexer, Merge, TxGraph,
+    Balance, CanonicalizationParams, ConfirmationBlockTime, IndexedTxGraph, Indexer, Merge,
+    TxGraph,
 };
 use bdk_core::bitcoin::{
     key::{Secp256k1, UntweakedPublicKey},
@@ -40,8 +41,8 @@ fn get_balance(
     let chain_tip = recv_chain.tip().block_id();
     let outpoints = recv_graph.index.outpoints().clone();
     let balance = recv_graph
-        .graph()
-        .balance(recv_chain, chain_tip, outpoints, |_, _| true);
+        .canonical_view(recv_chain, chain_tip, CanonicalizationParams::default())
+        .balance(outpoints, |_, _| true, 1);
     Ok(balance)
 }
 
@@ -66,7 +67,7 @@ where
     if let Some(chain_update) = update.chain_update.clone() {
         let _ = chain
             .apply_update(chain_update)
-            .map_err(|err| anyhow::anyhow!("LocalChain update error: {:?}", err))?;
+            .map_err(|err| anyhow::anyhow!("LocalChain update error: {err:?}"))?;
     }
     let _ = graph.apply_update(update.tx_update.clone());
 
@@ -88,7 +89,7 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let client = BdkElectrumClient::new(electrum_client);
 
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(SpkTxOutIndex::<()>::default());
-    let (chain, _) = LocalChain::from_genesis_hash(env.bitcoind.client.get_block_hash(0)?);
+    let (chain, _) = LocalChain::from_genesis(env.bitcoind.client.get_block_hash(0)?);
 
     // Get receiving address.
     let receiver_spk = get_test_spk();
@@ -145,7 +146,11 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let sync_request = SyncRequest::builder()
         .chain_tip(chain.tip())
         .spks_with_indexes(graph.index.all_spks().clone())
-        .expected_spk_txids(graph.list_expected_spk_txids(&chain, chain.tip().block_id(), ..));
+        .expected_spk_txids(
+            graph
+                .canonical_view(&chain, chain.tip().block_id(), Default::default())
+                .list_expected_spk_txids(&graph.index, ..),
+        );
     let sync_response = client.sync(sync_request, BATCH_SIZE, true)?;
     assert!(
         sync_response
@@ -170,7 +175,11 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let sync_request = SyncRequest::builder()
         .chain_tip(chain.tip())
         .spks_with_indexes(graph.index.all_spks().clone())
-        .expected_spk_txids(graph.list_expected_spk_txids(&chain, chain.tip().block_id(), ..));
+        .expected_spk_txids(
+            graph
+                .canonical_view(&chain, chain.tip().block_id(), Default::default())
+                .list_expected_spk_txids(&graph.index, ..),
+        );
     let sync_response = client.sync(sync_request, BATCH_SIZE, true)?;
     assert!(
         sync_response
@@ -231,7 +240,7 @@ pub fn chained_mempool_tx_sync() -> anyhow::Result<()> {
         .transaction()?;
     let txid2 = rpc_client.send_raw_transaction(signed_tx.raw_hex())?;
 
-    env.wait_until_electrum_sees_txid(signed_tx.compute_txid(), Duration::from_secs(5))?;
+    env.wait_until_electrum_sees_txid(signed_tx.compute_txid(), Duration::from_secs(6))?;
 
     let spk_history = electrum_client.script_get_history(&tracked_addr.script_pubkey())?;
     assert!(
@@ -507,7 +516,7 @@ fn test_sync() -> anyhow::Result<()> {
     let addr_to_track = Address::from_script(&spk_to_track, bdk_chain::bitcoin::Network::Regtest)?;
 
     // Setup receiver.
-    let (mut recv_chain, _) = LocalChain::from_genesis_hash(env.bitcoind.client.get_block_hash(0)?);
+    let (mut recv_chain, _) = LocalChain::from_genesis(env.bitcoind.client.get_block_hash(0)?);
     let mut recv_graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new({
         let mut recv_index = SpkTxOutIndex::default();
         recv_index.insert_spk((), spk_to_track.clone());
@@ -650,7 +659,7 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
     let addr_to_track = Address::from_script(&spk_to_track, bdk_chain::bitcoin::Network::Regtest)?;
 
     // Setup receiver.
-    let (mut recv_chain, _) = LocalChain::from_genesis_hash(env.bitcoind.client.get_block_hash(0)?);
+    let (mut recv_chain, _) = LocalChain::from_genesis(env.bitcoind.client.get_block_hash(0)?);
     let mut recv_graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new({
         let mut recv_index = SpkTxOutIndex::default();
         recv_index.insert_spk((), spk_to_track.clone());
@@ -718,8 +727,7 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
                 confirmed: SEND_AMOUNT * (REORG_COUNT - depth) as u64,
                 ..Balance::default()
             },
-            "reorg_count: {}",
-            depth,
+            "reorg_count: {depth}",
         );
     }
 
@@ -737,7 +745,7 @@ fn test_sync_with_coinbase() -> anyhow::Result<()> {
     let addr_to_track = Address::from_script(&spk_to_track, bdk_chain::bitcoin::Network::Regtest)?;
 
     // Setup receiver.
-    let (mut recv_chain, _) = LocalChain::from_genesis_hash(env.bitcoind.client.get_block_hash(0)?);
+    let (mut recv_chain, _) = LocalChain::from_genesis(env.bitcoind.client.get_block_hash(0)?);
     let mut recv_graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new({
         let mut recv_index = SpkTxOutIndex::default();
         recv_index.insert_spk((), spk_to_track.clone());
@@ -772,7 +780,7 @@ fn test_check_fee_calculation() -> anyhow::Result<()> {
     let addr_to_track = Address::from_script(&spk_to_track, bdk_chain::bitcoin::Network::Regtest)?;
 
     // Setup receiver.
-    let (mut recv_chain, _) = LocalChain::from_genesis_hash(env.bitcoind.client.get_block_hash(0)?);
+    let (mut recv_chain, _) = LocalChain::from_genesis(env.bitcoind.client.get_block_hash(0)?);
     let mut recv_graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new({
         let mut recv_index = SpkTxOutIndex::default();
         recv_index.insert_spk((), spk_to_track.clone());

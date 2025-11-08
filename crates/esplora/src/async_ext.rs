@@ -205,12 +205,16 @@ async fn fetch_block<S: Sleeper>(
 
     // We avoid fetching blocks higher than previously fetched `latest_blocks` as the local chain
     // tip is used to signal for the last-synced-up-to-height.
-    let &tip_height = latest_blocks
-        .keys()
-        .last()
-        .expect("must have atleast one entry");
-    if height > tip_height {
-        return Ok(None);
+    match latest_blocks.keys().last().copied() {
+        None => {
+            debug_assert!(false, "`latest_blocks` should not be empty");
+            return Ok(None);
+        }
+        Some(tip_height) => {
+            if height > tip_height {
+                return Ok(None);
+            }
+        }
     }
 
     Ok(Some(client.get_block_hash(height).await?))
@@ -223,34 +227,43 @@ async fn fetch_block<S: Sleeper>(
 async fn chain_update<S: Sleeper>(
     client: &esplora_client::AsyncClient<S>,
     latest_blocks: &BTreeMap<u32, BlockHash>,
-    local_tip: &CheckPoint,
+    local_tip: &CheckPoint<BlockHash>,
     anchors: &BTreeSet<(ConfirmationBlockTime, Txid)>,
-) -> Result<CheckPoint, Error> {
+) -> Result<CheckPoint<BlockHash>, Error> {
     let mut point_of_agreement = None;
+    let mut local_cp_hash = local_tip.hash();
     let mut conflicts = vec![];
+
     for local_cp in local_tip.iter() {
         let remote_hash = match fetch_block(client, latest_blocks, local_cp.height()).await? {
             Some(hash) => hash,
             None => continue,
         };
         if remote_hash == local_cp.hash() {
-            point_of_agreement = Some(local_cp.clone());
+            point_of_agreement = Some(local_cp);
             break;
-        } else {
-            // it is not strictly necessary to include all the conflicted heights (we do need the
-            // first one) but it seems prudent to make sure the updated chain's heights are a
-            // superset of the existing chain after update.
-            conflicts.push(BlockId {
-                height: local_cp.height(),
-                hash: remote_hash,
-            });
         }
+        local_cp_hash = local_cp.hash();
+        // It is not strictly necessary to include all the conflicted heights (we do need the
+        // first one) but it seems prudent to make sure the updated chain's heights are a
+        // superset of the existing chain after update.
+        conflicts.push(BlockId {
+            height: local_cp.height(),
+            hash: remote_hash,
+        });
     }
 
-    let mut tip = point_of_agreement.expect("remote esplora should have same genesis block");
+    let mut tip = match point_of_agreement {
+        Some(tip) => tip,
+        None => {
+            return Err(Box::new(esplora_client::Error::HeaderHashNotFound(
+                local_cp_hash,
+            )));
+        }
+    };
 
     tip = tip
-        .extend(conflicts.into_iter().rev())
+        .extend(conflicts.into_iter().rev().map(|b| (b.height, b.hash)))
         .expect("evicted are in order");
 
     for (anchor, _txid) in anchors {
@@ -260,14 +273,14 @@ async fn chain_update<S: Sleeper>(
                 Some(hash) => hash,
                 None => continue,
             };
-            tip = tip.insert(BlockId { height, hash });
+            tip = tip.insert(height, hash);
         }
     }
 
     // insert the most recent blocks at the tip to make sure we update the tip and make the update
     // robust.
     for (&height, &hash) in latest_blocks.iter() {
-        tip = tip.insert(BlockId { height, hash });
+        tip = tip.insert(height, hash);
     }
 
     Ok(tip)
@@ -537,6 +550,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod test {
     use std::{collections::BTreeSet, time::Duration};
 
@@ -545,7 +559,7 @@ mod test {
         local_chain::LocalChain,
         BlockId,
     };
-    use bdk_core::ConfirmationBlockTime;
+    use bdk_core::{bitcoin, ConfirmationBlockTime};
     use bdk_testenv::{anyhow, bitcoincore_rpc::RpcApi, TestEnv};
     use esplora_client::Builder;
 
@@ -557,7 +571,40 @@ mod test {
         }};
     }
 
-    /// Ensure that update does not remove heights (from original), and all anchor heights are included.
+    // Test that `chain_update` fails due to wrong network.
+    #[tokio::test]
+    async fn test_chain_update_wrong_network_error() -> anyhow::Result<()> {
+        let env = TestEnv::new()?;
+        let base_url = format!("http://{}", &env.electrsd.esplora_url.clone().unwrap());
+        let client = Builder::new(base_url.as_str()).build_async()?;
+        let initial_height = env.rpc_client().get_block_count()? as u32;
+
+        let mine_to = 16;
+        let _ = env.mine_blocks((mine_to - initial_height) as usize, None)?;
+        while client.get_height().await? < mine_to {
+            std::thread::sleep(Duration::from_millis(64));
+        }
+        let latest_blocks = fetch_latest_blocks(&client).await?;
+        assert!(!latest_blocks.is_empty());
+        assert_eq!(latest_blocks.keys().last(), Some(&mine_to));
+
+        let genesis_hash =
+            bitcoin::constants::genesis_block(bitcoin::Network::Testnet4).block_hash();
+        let cp = bdk_chain::CheckPoint::new(0, genesis_hash);
+
+        let anchors = BTreeSet::new();
+        let res = chain_update(&client, &latest_blocks, &cp, &anchors).await;
+        use esplora_client::Error;
+        assert!(
+            matches!(*res.unwrap_err(), Error::HeaderHashNotFound(hash) if hash == genesis_hash),
+            "`chain_update` should error if it can't connect to the local CP",
+        );
+
+        Ok(())
+    }
+
+    /// Ensure that update does not remove heights (from original), and all anchor heights are
+    /// included.
     #[tokio::test]
     pub async fn test_finalize_chain_update() -> anyhow::Result<()> {
         struct TestCase<'a> {
@@ -569,8 +616,8 @@ mod test {
             initial_cps: &'a [u32],
             /// The final blockchain height of the env.
             final_env_height: u32,
-            /// The anchors to test with: `(height, txid)`. Only the height is provided as we can fetch
-            /// the blockhash from the env.
+            /// The anchors to test with: `(height, txid)`. Only the height is provided as we can
+            /// fetch the blockhash from the env.
             anchors: &'a [(u32, Txid)],
         }
 
@@ -616,7 +663,7 @@ mod test {
 
             // craft initial `local_chain`
             let local_chain = {
-                let (mut chain, _) = LocalChain::from_genesis_hash(env.genesis_hash()?);
+                let (mut chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
                 // force `chain_update_blocking` to add all checkpoints in `t.initial_cps`
                 let anchors = t
                     .initial_cps

@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 pub mod utils;
 
 use bdk_chain::{
@@ -7,7 +9,6 @@ use bdk_chain::{
         ScriptBuf, ScriptHash, Transaction, TxIn, TxOut, Txid,
     },
     local_chain::CheckPoint,
-    BlockId,
 };
 use bitcoincore_rpc::{
     bitcoincore_rpc_json::{GetBlockTemplateModes, GetBlockTemplateRules},
@@ -205,9 +206,10 @@ impl TestEnv {
             std::thread::sleep(delay);
         }
 
-        Err(anyhow::Error::msg(
-            "Timed out waiting for Electrsd to get block header",
-        ))
+        Err(anyhow::Error::msg(format!(
+            "Timed out waiting for Electrsd to get transaction, took: {:?}",
+            start.elapsed()
+        )))
     }
 
     /// This method waits for Electrsd to see a transaction with given `txid`. `timeout` is the
@@ -228,9 +230,10 @@ impl TestEnv {
             std::thread::sleep(delay);
         }
 
-        Err(anyhow::Error::msg(
-            "Timed out waiting for Electrsd to get transaction",
-        ))
+        Err(anyhow::Error::msg(format!(
+            "Timed out waiting for Electrsd to get transaction, took: {:?}",
+            start.elapsed()
+        )))
     }
 
     /// Invalidate a number of blocks of a given size `count`.
@@ -292,13 +295,13 @@ impl TestEnv {
     }
 
     /// Create a checkpoint linked list of all the blocks in the chain.
-    pub fn make_checkpoint_tip(&self) -> CheckPoint {
-        CheckPoint::from_block_ids((0_u32..).map_while(|height| {
+    pub fn make_checkpoint_tip(&self) -> CheckPoint<BlockHash> {
+        CheckPoint::from_blocks((0_u32..).map_while(|height| {
             self.bitcoind
                 .client
                 .get_block_hash(height as u64)
                 .ok()
-                .map(|hash| BlockId { height, hash })
+                .map(|hash| (height, hash))
         }))
         .expect("must craft tip")
     }
@@ -311,6 +314,7 @@ impl TestEnv {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod test {
     use crate::TestEnv;
     use core::time::Duration;

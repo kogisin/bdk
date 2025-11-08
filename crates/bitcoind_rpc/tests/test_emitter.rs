@@ -1,14 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::BTreeSet, ops::Deref};
 
-use bdk_bitcoind_rpc::Emitter;
+use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXS};
 use bdk_chain::{
     bitcoin::{Address, Amount, Txid},
     local_chain::{CheckPoint, LocalChain},
     spk_txout::SpkTxOutIndex,
-    Balance, BlockId, IndexedTxGraph, Merge,
+    Balance, BlockId, CanonicalizationParams, IndexedTxGraph, Merge,
 };
 use bdk_testenv::{anyhow, TestEnv};
-use bitcoin::{hashes::Hash, Block, OutPoint, ScriptBuf, WScriptHash};
+use bitcoin::{hashes::Hash, Block, Network, OutPoint, ScriptBuf, WScriptHash};
 use bitcoincore_rpc::RpcApi;
 
 /// Ensure that blocks are emitted in order even after reorg.
@@ -21,8 +21,13 @@ use bitcoincore_rpc::RpcApi;
 pub fn test_sync_local_chain() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     let network_tip = env.rpc_client().get_block_count()?;
-    let (mut local_chain, _) = LocalChain::from_genesis_hash(env.rpc_client().get_block_hash(0)?);
-    let mut emitter = Emitter::new(env.rpc_client(), local_chain.tip(), 0);
+    let (mut local_chain, _) = LocalChain::from_genesis(env.rpc_client().get_block_hash(0)?);
+    let mut emitter = Emitter::new(
+        env.rpc_client(),
+        local_chain.tip(),
+        0,
+        NO_EXPECTED_MEMPOOL_TXS,
+    );
 
     // Mine some blocks and return the actual block hashes.
     // Because initializing `ElectrsD` already mines some blocks, we must include those too when
@@ -147,7 +152,7 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
 
     env.mine_blocks(101, None)?;
 
-    let (mut chain, _) = LocalChain::from_genesis_hash(env.rpc_client().get_block_hash(0)?);
+    let (mut chain, _) = LocalChain::from_genesis(env.rpc_client().get_block_hash(0)?);
     let mut indexed_tx_graph = IndexedTxGraph::<BlockId, _>::new({
         let mut index = SpkTxOutIndex::<usize>::default();
         index.insert_spk(0, addr_0.script_pubkey());
@@ -156,7 +161,7 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
         index
     });
 
-    let emitter = &mut Emitter::new(env.rpc_client(), chain.tip(), 0);
+    let emitter = &mut Emitter::new(env.rpc_client(), chain.tip(), 0, NO_EXPECTED_MEMPOOL_TXS);
 
     while let Some(emission) = emitter.next_block()? {
         let height = emission.block_height();
@@ -189,7 +194,7 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
         assert!(emitter.next_block()?.is_none());
 
         let mempool_txs = emitter.mempool()?;
-        let indexed_additions = indexed_tx_graph.batch_insert_unconfirmed(mempool_txs);
+        let indexed_additions = indexed_tx_graph.batch_insert_unconfirmed(mempool_txs.update);
         assert_eq!(
             indexed_additions
                 .tx_graph
@@ -247,19 +252,17 @@ fn ensure_block_emitted_after_reorg_is_at_reorg_height() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     let mut emitter = Emitter::new(
         env.rpc_client(),
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: env.rpc_client().get_block_hash(0)?,
-        }),
+        CheckPoint::new(0, env.rpc_client().get_block_hash(0)?),
         EMITTER_START_HEIGHT as _,
+        NO_EXPECTED_MEMPOOL_TXS,
     );
 
     env.mine_blocks(CHAIN_TIP_HEIGHT, None)?;
-    while emitter.next_header()?.is_some() {}
+    while emitter.next_block()?.is_some() {}
 
     for reorg_count in 1..=10 {
         let replaced_blocks = env.reorg_empty_blocks(reorg_count)?;
-        let next_emission = emitter.next_header()?.expect("must emit block after reorg");
+        let next_emission = emitter.next_block()?.expect("must emit block after reorg");
         assert_eq!(
             (
                 next_emission.block_height() as usize,
@@ -268,7 +271,7 @@ fn ensure_block_emitted_after_reorg_is_at_reorg_height() -> anyhow::Result<()> {
             replaced_blocks[0],
             "block emitted after reorg should be at the reorg height"
         );
-        while emitter.next_header()?.is_some() {}
+        while emitter.next_block()?.is_some() {}
     }
 
     Ok(())
@@ -280,7 +283,7 @@ fn process_block(
     block: Block,
     block_height: u32,
 ) -> anyhow::Result<()> {
-    recv_chain.apply_update(CheckPoint::from_header(&block.header, block_height))?;
+    recv_chain.apply_header(&block.header, block_height)?;
     let _ = recv_graph.apply_block(block, block_height);
     Ok(())
 }
@@ -291,7 +294,8 @@ fn sync_from_emitter<C>(
     emitter: &mut Emitter<C>,
 ) -> anyhow::Result<()>
 where
-    C: bitcoincore_rpc::RpcApi,
+    C: Deref,
+    C::Target: bitcoincore_rpc::RpcApi,
 {
     while let Some(emission) = emitter.next_block()? {
         let height = emission.block_height();
@@ -307,8 +311,8 @@ fn get_balance(
     let chain_tip = recv_chain.tip().block_id();
     let outpoints = recv_graph.index.outpoints().clone();
     let balance = recv_graph
-        .graph()
-        .balance(recv_chain, chain_tip, outpoints, |_, _| true);
+        .canonical_view(recv_chain, chain_tip, CanonicalizationParams::default())
+        .balance(outpoints, |_, _| true, 1);
     Ok(balance)
 }
 
@@ -323,11 +327,9 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     let mut emitter = Emitter::new(
         env.rpc_client(),
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: env.rpc_client().get_block_hash(0)?,
-        }),
+        CheckPoint::new(0, env.rpc_client().get_block_hash(0)?),
         0,
+        NO_EXPECTED_MEMPOOL_TXS,
     );
 
     // setup addresses
@@ -336,10 +338,10 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
         .get_new_address(None, None)?
         .assume_checked();
     let spk_to_track = ScriptBuf::new_p2wsh(&WScriptHash::all_zeros());
-    let addr_to_track = Address::from_script(&spk_to_track, bitcoin::Network::Regtest)?;
+    let addr_to_track = Address::from_script(&spk_to_track, Network::Regtest)?;
 
     // setup receiver
-    let (mut recv_chain, _) = LocalChain::from_genesis_hash(env.rpc_client().get_block_hash(0)?);
+    let (mut recv_chain, _) = LocalChain::from_genesis(env.rpc_client().get_block_hash(0)?);
     let mut recv_graph = IndexedTxGraph::<BlockId, _>::new({
         let mut recv_index = SpkTxOutIndex::default();
         recv_index.insert_spk((), spk_to_track.clone());
@@ -393,8 +395,7 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
                 confirmed: SEND_AMOUNT * (ADDITIONAL_COUNT - reorg_count) as u64,
                 ..Balance::default()
             },
-            "reorg_count: {}",
-            reorg_count,
+            "reorg_count: {reorg_count}",
         );
     }
 
@@ -414,11 +415,9 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     let mut emitter = Emitter::new(
         env.rpc_client(),
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: env.rpc_client().get_block_hash(0)?,
-        }),
+        CheckPoint::new(0, env.rpc_client().get_block_hash(0)?),
         0,
+        NO_EXPECTED_MEMPOOL_TXS,
     );
 
     // mine blocks and sync up emitter
@@ -427,16 +426,35 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
         .get_new_address(None, None)?
         .assume_checked();
     env.mine_blocks(BLOCKS_TO_MINE, Some(addr.clone()))?;
-    while emitter.next_header()?.is_some() {}
+    while emitter.next_block()?.is_some() {}
 
     // have some random txs in mempool
     let exp_txids = (0..MEMPOOL_TX_COUNT)
         .map(|_| env.send(&addr, Amount::from_sat(2100)))
         .collect::<Result<BTreeSet<Txid>, _>>()?;
 
-    // the first emission should include all transactions
+    // First two emissions should include all transactions.
+    for _ in 0..2 {
+        let emitted_txids = emitter
+            .mempool()?
+            .update
+            .into_iter()
+            .map(|(tx, _)| tx.compute_txid())
+            .collect::<BTreeSet<Txid>>();
+        assert_eq!(
+            emitted_txids, exp_txids,
+            "all mempool txs should be emitted"
+        );
+    }
+
+    // mine empty blocks + sync up our emitter -> we should still not re-emit
+    for _ in 0..BLOCKS_TO_MINE {
+        env.mine_empty_block()?;
+    }
+    while emitter.next_block()?.is_some() {}
     let emitted_txids = emitter
         .mempool()?
+        .update
         .into_iter()
         .map(|(tx, _)| tx.compute_txid())
         .collect::<BTreeSet<Txid>>();
@@ -444,230 +462,6 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
         emitted_txids, exp_txids,
         "all mempool txs should be emitted"
     );
-
-    // second emission should be empty
-    assert!(
-        emitter.mempool()?.is_empty(),
-        "second emission should be empty"
-    );
-
-    // mine empty blocks + sync up our emitter -> we should still not re-emit
-    for _ in 0..BLOCKS_TO_MINE {
-        env.mine_empty_block()?;
-    }
-    while emitter.next_header()?.is_some() {}
-    assert!(
-        emitter.mempool()?.is_empty(),
-        "third emission, after chain tip is extended, should also be empty"
-    );
-
-    Ok(())
-}
-
-/// Ensure mempool tx is still re-emitted if [`Emitter`] has not reached the tx's introduction
-/// height.
-///
-/// We introduce a mempool tx after each block, where blocks are empty (does not confirm previous
-/// mempool txs). Then we emit blocks from [`Emitter`] (intertwining `mempool` calls). We check
-/// that `mempool` should always re-emit txs that have introduced at a height greater than the last
-/// emitted block height.
-#[test]
-fn mempool_re_emits_if_tx_introduction_height_not_reached() -> anyhow::Result<()> {
-    const PREMINE_COUNT: usize = 101;
-    const MEMPOOL_TX_COUNT: usize = 21;
-
-    let env = TestEnv::new()?;
-    let mut emitter = Emitter::new(
-        env.rpc_client(),
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: env.rpc_client().get_block_hash(0)?,
-        }),
-        0,
-    );
-
-    // mine blocks to get initial balance, sync emitter up to tip
-    let addr = env
-        .rpc_client()
-        .get_new_address(None, None)?
-        .assume_checked();
-    env.mine_blocks(PREMINE_COUNT, Some(addr.clone()))?;
-    while emitter.next_header()?.is_some() {}
-
-    // mine blocks to introduce txs to mempool at different heights
-    let tx_introductions = (0..MEMPOOL_TX_COUNT)
-        .map(|_| -> anyhow::Result<_> {
-            let (height, _) = env.mine_empty_block()?;
-            let txid = env.send(&addr, Amount::from_sat(2100))?;
-            Ok((height, txid))
-        })
-        .collect::<anyhow::Result<BTreeSet<_>>>()?;
-
-    assert_eq!(
-        emitter
-            .mempool()?
-            .into_iter()
-            .map(|(tx, _)| tx.compute_txid())
-            .collect::<BTreeSet<_>>(),
-        tx_introductions.iter().map(|&(_, txid)| txid).collect(),
-        "first mempool emission should include all txs",
-    );
-    assert_eq!(
-        emitter
-            .mempool()?
-            .into_iter()
-            .map(|(tx, _)| tx.compute_txid())
-            .collect::<BTreeSet<_>>(),
-        tx_introductions.iter().map(|&(_, txid)| txid).collect(),
-        "second mempool emission should still include all txs",
-    );
-
-    // At this point, the emitter has seen all mempool transactions. It should only re-emit those
-    // that have introduction heights less than the emitter's last-emitted block tip.
-    while let Some(emission) = emitter.next_header()? {
-        let height = emission.block_height();
-        // We call `mempool()` twice.
-        // The second call (at height `h`) should skip the tx introduced at height `h`.
-        for try_index in 0..2 {
-            let exp_txids = tx_introductions
-                .range((height as usize + try_index, Txid::all_zeros())..)
-                .map(|&(_, txid)| txid)
-                .collect::<BTreeSet<_>>();
-            let emitted_txids = emitter
-                .mempool()?
-                .into_iter()
-                .map(|(tx, _)| tx.compute_txid())
-                .collect::<BTreeSet<_>>();
-            assert_eq!(
-                emitted_txids, exp_txids,
-                "\n emission {} (try {}) must only contain txs introduced at that height or lower: \n\t missing: {:?} \n\t extra: {:?}",
-                height,
-                try_index,
-                exp_txids
-                    .difference(&emitted_txids)
-                    .map(|txid| (txid, tx_introductions.iter().find_map(|(h, id)| if id == txid { Some(h) } else { None }).unwrap()))
-                    .collect::<Vec<_>>(),
-                emitted_txids
-                    .difference(&exp_txids)
-                    .map(|txid| (txid, tx_introductions.iter().find_map(|(h, id)| if id == txid { Some(h) } else { None }).unwrap()))
-                    .collect::<Vec<_>>(),
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Ensure we force re-emit all mempool txs after reorg.
-#[test]
-fn mempool_during_reorg() -> anyhow::Result<()> {
-    const TIP_DIFF: usize = 10;
-    const PREMINE_COUNT: usize = 101;
-
-    let env = TestEnv::new()?;
-    let mut emitter = Emitter::new(
-        env.rpc_client(),
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: env.rpc_client().get_block_hash(0)?,
-        }),
-        0,
-    );
-
-    // mine blocks to get initial balance
-    let addr = env
-        .rpc_client()
-        .get_new_address(None, None)?
-        .assume_checked();
-    env.mine_blocks(PREMINE_COUNT, Some(addr.clone()))?;
-
-    // introduce mempool tx at each block extension
-    for _ in 0..TIP_DIFF {
-        env.mine_empty_block()?;
-        env.send(&addr, Amount::from_sat(2100))?;
-    }
-
-    // sync emitter to tip, first mempool emission should include all txs (as we haven't emitted
-    // from the mempool yet)
-    while emitter.next_header()?.is_some() {}
-    assert_eq!(
-        emitter
-            .mempool()?
-            .into_iter()
-            .map(|(tx, _)| tx.compute_txid())
-            .collect::<BTreeSet<_>>(),
-        env.rpc_client()
-            .get_raw_mempool()?
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
-        "first mempool emission should include all txs",
-    );
-
-    // perform reorgs at different heights, these reorgs will not confirm transactions in the
-    // mempool
-    for reorg_count in 1..TIP_DIFF {
-        env.reorg_empty_blocks(reorg_count)?;
-
-        // This is a map of mempool txids to tip height where the tx was introduced to the mempool
-        // we recalculate this at every loop as reorgs may evict transactions from mempool. We use
-        // the introduction height to determine whether we expect a tx to appear in a mempool
-        // emission.
-        // TODO: How can have have reorg logic in `TestEnv` NOT blacklast old blocks first?
-        let tx_introductions = dbg!(env
-            .rpc_client()
-            .get_raw_mempool_verbose()?
-            .into_iter()
-            .map(|(txid, entry)| (txid, entry.height as usize))
-            .collect::<BTreeMap<_, _>>());
-
-        // `next_header` emits the replacement block of the reorg
-        if let Some(emission) = emitter.next_header()? {
-            let height = emission.block_height();
-
-            // the mempool emission (that follows the first block emission after reorg) should only
-            // include mempool txs introduced at reorg height or greater
-            let mempool = emitter
-                .mempool()?
-                .into_iter()
-                .map(|(tx, _)| tx.compute_txid())
-                .collect::<BTreeSet<_>>();
-            let exp_mempool = tx_introductions
-                .iter()
-                .filter(|(_, &intro_h)| intro_h >= (height as usize))
-                .map(|(&txid, _)| txid)
-                .collect::<BTreeSet<_>>();
-            assert_eq!(
-                mempool, exp_mempool,
-                "the first mempool emission after reorg should only include mempool txs introduced at reorg height or greater"
-            );
-
-            let mempool = emitter
-                .mempool()?
-                .into_iter()
-                .map(|(tx, _)| tx.compute_txid())
-                .collect::<BTreeSet<_>>();
-            let exp_mempool = tx_introductions
-                .iter()
-                .filter(|&(_, &intro_height)| intro_height > (height as usize))
-                .map(|(&txid, _)| txid)
-                .collect::<BTreeSet<_>>();
-            assert_eq!(
-                mempool, exp_mempool,
-                "following mempool emissions after reorg should exclude mempool introduction heights <= last emitted block height: \n\t missing: {:?} \n\t extra: {:?}",
-                exp_mempool
-                    .difference(&mempool)
-                    .map(|txid| (txid, tx_introductions.get(txid).unwrap()))
-                    .collect::<Vec<_>>(),
-                mempool
-                    .difference(&exp_mempool)
-                    .map(|txid| (txid, tx_introductions.get(txid).unwrap()))
-                    .collect::<Vec<_>>(),
-            );
-        }
-
-        // sync emitter to tip
-        while emitter.next_header()?.is_some() {}
-    }
 
     Ok(())
 }
@@ -691,23 +485,25 @@ fn no_agreement_point() -> anyhow::Result<()> {
     // start height is 99
     let mut emitter = Emitter::new(
         env.rpc_client(),
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: env.rpc_client().get_block_hash(0)?,
-        }),
+        CheckPoint::new(0, env.rpc_client().get_block_hash(0)?),
         (PREMINE_COUNT - 2) as u32,
+        NO_EXPECTED_MEMPOOL_TXS,
     );
 
     // mine 101 blocks
     env.mine_blocks(PREMINE_COUNT, None)?;
 
     // emit block 99a
-    let block_header_99a = emitter.next_header()?.expect("block 99a header").block;
+    let block_header_99a = emitter
+        .next_block()?
+        .expect("block 99a header")
+        .block
+        .header;
     let block_hash_99a = block_header_99a.block_hash();
     let block_hash_98a = block_header_99a.prev_blockhash;
 
     // emit block 100a
-    let block_header_100a = emitter.next_header()?.expect("block 100a header").block;
+    let block_header_100a = emitter.next_block()?.expect("block 100a header").block;
     let block_hash_100a = block_header_100a.block_hash();
 
     // get hash for block 101a
@@ -722,12 +518,158 @@ fn no_agreement_point() -> anyhow::Result<()> {
     env.mine_blocks(3, None)?;
 
     // emit block header 99b
-    let block_header_99b = emitter.next_header()?.expect("block 99b header").block;
+    let block_header_99b = emitter
+        .next_block()?
+        .expect("block 99b header")
+        .block
+        .header;
     let block_hash_99b = block_header_99b.block_hash();
     let block_hash_98b = block_header_99b.prev_blockhash;
 
     assert_ne!(block_hash_99a, block_hash_99b);
     assert_eq!(block_hash_98a, block_hash_98b);
+
+    Ok(())
+}
+
+/// Validates that when an unconfirmed transaction is double-spent (and thus evicted from the
+/// mempool), the emitter reports it in `evicted_txids`, and after inserting that eviction into the
+/// graph it no longer appears in the set of canonical transactions.
+///
+/// 1. Broadcast a first tx (tx1) and confirm it arrives in unconfirmed set.
+/// 2. Double-spend tx1 with tx1b and verify `mempool()` reports tx1 as evicted.
+/// 3. Insert the eviction into the graph and assert tx1 is no longer canonical.
+#[test]
+fn test_expect_tx_evicted() -> anyhow::Result<()> {
+    use bdk_bitcoind_rpc::bitcoincore_rpc::bitcoin;
+    use bdk_bitcoind_rpc::bitcoincore_rpc::bitcoincore_rpc_json::CreateRawTransactionInput;
+    use bdk_chain::miniscript;
+    use bdk_chain::spk_txout::SpkTxOutIndex;
+    use bitcoin::constants::genesis_block;
+    use bitcoin::secp256k1::Secp256k1;
+    use bitcoin::Network;
+    use std::collections::HashMap;
+    let env = TestEnv::new()?;
+
+    let s = bdk_testenv::utils::DESCRIPTORS[0];
+    let desc = miniscript::Descriptor::parse_descriptor(&Secp256k1::new(), s)
+        .unwrap()
+        .0;
+    let spk = desc.at_derivation_index(0)?.script_pubkey();
+
+    let mut chain = LocalChain::from_genesis(genesis_block(Network::Regtest).block_hash()).0;
+    let chain_tip = chain.tip().block_id();
+
+    let mut index = SpkTxOutIndex::default();
+    index.insert_spk((), spk.clone());
+    let mut graph = IndexedTxGraph::<BlockId, _>::new(index);
+
+    // Receive tx1.
+    let _ = env.mine_blocks(100, None)?;
+    let txid_1 = env.send(
+        &Address::from_script(&spk, Network::Regtest)?,
+        Amount::ONE_BTC,
+    )?;
+    let tx_1 = env
+        .rpc_client()
+        .get_transaction(&txid_1, None)?
+        .transaction()?;
+
+    let mut emitter = Emitter::new(env.rpc_client(), chain.tip(), 1, core::iter::once(tx_1));
+    while let Some(emission) = emitter.next_block()? {
+        let height = emission.block_height();
+        chain.apply_header(&emission.block.header, height)?;
+    }
+
+    let changeset = graph.batch_insert_unconfirmed(emitter.mempool()?.update);
+    assert!(changeset
+        .tx_graph
+        .txs
+        .iter()
+        .any(|tx| tx.compute_txid() == txid_1));
+
+    // Double spend tx1.
+
+    // Get `prevout` from core.
+    let core = env.rpc_client();
+    let tx1 = &core.get_raw_transaction(&txid_1, None)?;
+    let txin = &tx1.input[0];
+    let op = txin.previous_output;
+
+    // Create `tx1b` using the previous output from tx1.
+    let utxo = CreateRawTransactionInput {
+        txid: op.txid,
+        vout: op.vout,
+        sequence: None,
+    };
+    let addr = core.get_new_address(None, None)?.assume_checked();
+    let tx = core.create_raw_transaction(
+        &[utxo],
+        &HashMap::from([(addr.to_string(), Amount::from_btc(49.99)?)]),
+        None,
+        None,
+    )?;
+    let res = core.sign_raw_transaction_with_wallet(&tx, None, None)?;
+    let tx1b = res.transaction()?;
+
+    // Send the tx.
+    let _txid_2 = core.send_raw_transaction(&tx1b)?;
+
+    // Retrieve the expected unconfirmed txids and spks from the graph.
+    let exp_spk_txids = graph
+        .canonical_view(&chain, chain_tip, Default::default())
+        .list_expected_spk_txids(&graph.index, ..)
+        .collect::<Vec<_>>();
+    assert_eq!(exp_spk_txids, vec![(spk, txid_1)]);
+
+    // Check that mempool emission contains evicted txid.
+    let mempool_event = emitter.mempool()?;
+    assert!(mempool_event
+        .evicted
+        .iter()
+        .any(|(txid, _)| txid == &txid_1));
+
+    // Update graph with evicted tx.
+    let _ = graph.batch_insert_relevant_evicted_at(mempool_event.evicted);
+
+    let canonical_txids = graph
+        .canonical_view(&chain, chain_tip, CanonicalizationParams::default())
+        .txs()
+        .map(|tx| tx.txid)
+        .collect::<Vec<_>>();
+    // tx1 should no longer be canonical.
+    assert!(!canonical_txids.contains(&txid_1));
+
+    Ok(())
+}
+
+#[test]
+fn detect_new_mempool_txs() -> anyhow::Result<()> {
+    let env = TestEnv::new()?;
+    env.mine_blocks(101, None)?;
+
+    let addr = env
+        .rpc_client()
+        .get_new_address(None, None)?
+        .require_network(Network::Regtest)?;
+
+    let mut emitter = Emitter::new(
+        env.rpc_client(),
+        CheckPoint::new(0, env.rpc_client().get_block_hash(0)?),
+        0,
+        NO_EXPECTED_MEMPOOL_TXS,
+    );
+
+    while emitter.next_block()?.is_some() {}
+
+    for n in 0..5 {
+        let txid = env.send(&addr, Amount::ONE_BTC)?;
+        let new_txs = emitter.mempool()?.update;
+        assert!(
+            new_txs.iter().any(|(tx, _)| tx.compute_txid() == txid),
+            "must detect new tx {n}"
+        );
+    }
 
     Ok(())
 }

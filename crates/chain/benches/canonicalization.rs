@@ -1,3 +1,4 @@
+use bdk_chain::CanonicalizationParams;
 use bdk_chain::{keychain_txout::KeychainTxOutIndex, local_chain::LocalChain, IndexedTxGraph};
 use bdk_core::{BlockId, CheckPoint};
 use bdk_core::{ConfirmationBlockTime, TxUpdate};
@@ -6,7 +7,7 @@ use bitcoin::{
     absolute, constants, hashes::Hash, key::Secp256k1, transaction, Amount, BlockHash, Network,
     OutPoint, ScriptBuf, Transaction, TxIn, TxOut,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use miniscript::{Descriptor, DescriptorPublicKey};
 use std::sync::Arc;
 
@@ -75,13 +76,17 @@ fn add_ancestor_tx(graph: &mut KeychainTxGraph, block_id: BlockId, locktime: u32
 
 fn setup<F: Fn(&mut KeychainTxGraph, &LocalChain)>(f: F) -> (KeychainTxGraph, LocalChain) {
     const DESC: &str = "tr([ab28dc00/86h/1h/0h]tpubDCdDtzAMZZrkwKBxwNcGCqe4FRydeD9rfMisoi7qLdraG79YohRfPW4YgdKQhpgASdvh612xXNY5xYzoqnyCgPbkpK4LSVcH5Xv4cK7johH/0/*)";
-    let cp = CheckPoint::from_block_ids([genesis_block_id(), tip_block_id()])
-        .expect("blocks must be chronological");
+    let cp = CheckPoint::from_blocks(
+        [genesis_block_id(), tip_block_id()]
+            .into_iter()
+            .map(|block_id| (block_id.height, block_id.hash)),
+    )
+    .expect("blocks must be chronological");
     let chain = LocalChain::from_tip(cp).unwrap();
 
     let (desc, _) =
         <Descriptor<DescriptorPublicKey>>::parse_descriptor(&Secp256k1::new(), DESC).unwrap();
-    let mut index = KeychainTxOutIndex::new(10);
+    let mut index = KeychainTxOutIndex::new(10, true);
     index.insert_descriptor((), desc).unwrap();
     let mut tx_graph = KeychainTxGraph::new(index);
 
@@ -90,33 +95,38 @@ fn setup<F: Fn(&mut KeychainTxGraph, &LocalChain)>(f: F) -> (KeychainTxGraph, Lo
 }
 
 fn run_list_canonical_txs(tx_graph: &KeychainTxGraph, chain: &LocalChain, exp_txs: usize) {
-    let txs = tx_graph
-        .graph()
-        .list_canonical_txs(chain, chain.tip().block_id());
+    let view = tx_graph.canonical_view(
+        chain,
+        chain.tip().block_id(),
+        CanonicalizationParams::default(),
+    );
+    let txs = view.txs();
     assert_eq!(txs.count(), exp_txs);
 }
 
 fn run_filter_chain_txouts(tx_graph: &KeychainTxGraph, chain: &LocalChain, exp_txos: usize) {
-    let utxos = tx_graph.graph().filter_chain_txouts(
+    let view = tx_graph.canonical_view(
         chain,
         chain.tip().block_id(),
-        tx_graph.index.outpoints().clone(),
+        CanonicalizationParams::default(),
     );
+    let utxos = view.filter_outpoints(tx_graph.index.outpoints().clone());
     assert_eq!(utxos.count(), exp_txos);
 }
 
 fn run_filter_chain_unspents(tx_graph: &KeychainTxGraph, chain: &LocalChain, exp_utxos: usize) {
-    let utxos = tx_graph.graph().filter_chain_unspents(
+    let view = tx_graph.canonical_view(
         chain,
         chain.tip().block_id(),
-        tx_graph.index.outpoints().clone(),
+        CanonicalizationParams::default(),
     );
+    let utxos = view.filter_unspent_outpoints(tx_graph.index.outpoints().clone());
     assert_eq!(utxos.count(), exp_utxos);
 }
 
 pub fn many_conflicting_unconfirmed(c: &mut Criterion) {
     const CONFLICTING_TX_COUNT: u32 = 2100;
-    let (tx_graph, chain) = black_box(setup(|tx_graph, _chain| {
+    let (tx_graph, chain) = std::hint::black_box(setup(|tx_graph, _chain| {
         let previous_output = add_ancestor_tx(tx_graph, tip_block_id(), 0);
         // Create conflicting txs that spend from `previous_output`.
         let spk_1 = spk_at_index(&tx_graph.index, 1);
@@ -154,7 +164,7 @@ pub fn many_conflicting_unconfirmed(c: &mut Criterion) {
 
 pub fn many_chained_unconfirmed(c: &mut Criterion) {
     const TX_CHAIN_COUNT: u32 = 2100;
-    let (tx_graph, chain) = black_box(setup(|tx_graph, _chain| {
+    let (tx_graph, chain) = std::hint::black_box(setup(|tx_graph, _chain| {
         let mut previous_output = add_ancestor_tx(tx_graph, tip_block_id(), 0);
         // Create a chain of unconfirmed txs where each subsequent tx spends the output of the
         // previous one.
@@ -193,7 +203,7 @@ pub fn many_chained_unconfirmed(c: &mut Criterion) {
 pub fn nested_conflicts(c: &mut Criterion) {
     const CONFLICTS_PER_OUTPUT: usize = 3;
     const GRAPH_DEPTH: usize = 7;
-    let (tx_graph, chain) = black_box(setup(|tx_graph, _chain| {
+    let (tx_graph, chain) = std::hint::black_box(setup(|tx_graph, _chain| {
         let mut prev_ops = core::iter::once(add_ancestor_tx(tx_graph, tip_block_id(), 0))
             .collect::<Vec<OutPoint>>();
         for depth in 1..GRAPH_DEPTH {

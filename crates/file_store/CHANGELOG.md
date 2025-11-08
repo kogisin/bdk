@@ -7,6 +7,34 @@ Contributors do not need to change this file but do need to add changelog detail
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [file_store-0.22.0]
+
+### Changed
+- `Changeset` field of `StoreErrorWithDump` is now of type `Option<Box<C>>` #1998
+
+## [file_store-0.21.1]
+
+### Added
+
+- Introduce usage of `cfg_attr(coverage_nightly)` in order to not consider tests under coverage. #1986
+
+### Changed
+
+- Fix `clippy` formatting warnings for `StoreError` and test assertions #1990
+- Bump `bdk_core` to `0.6.1`
+
+## [file_store-0.21.0]
+
+### Changed
+
+- bump bdk_core to 0.6.0
+
+## [file_store-0.20.0]
+
+### Changed
+
+- deps: bump `bdk_core` to 0.5.0
+
 ## [file_store-0.19.0]
 
 ### Added:
@@ -35,3 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [file_store-0.18.1]: https://github.com/bitcoindevkit/bdk/releases/tag/file_store-0.18.1
 [file_store-0.19.0]: https://github.com/bitcoindevkit/bdk/releases/tag/file_store-0.19.0
+[file_store-0.20.0]: https://github.com/bitcoindevkit/bdk/releases/tag/file_store-0.20.0
+[file_store-0.21.0]: https://github.com/bitcoindevkit/bdk/releases/tag/file_store-0.21.0
+[file_store-0.21.1]: https://github.com/bitcoindevkit/bdk/releases/tag/file_store-0.21.1
+[file_store-0.22.0]: https://github.com/bitcoindevkit/bdk/releases/tag/file_store-0.22.0

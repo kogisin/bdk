@@ -19,6 +19,7 @@
 //! Just like how [`EsploraExt`] extends the functionality of an
 //! [`esplora_client::BlockingClient`], [`EsploraAsyncExt`] is the async version which extends
 //! [`esplora_client::AsyncClient`].
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 use bdk_core::bitcoin::{Amount, OutPoint, TxOut, Txid};
 use bdk_core::{BlockId, ConfirmationBlockTime, TxUpdate};
@@ -36,6 +37,7 @@ mod async_ext;
 #[cfg(feature = "async")]
 pub use async_ext::*;
 
+#[allow(dead_code)]
 fn insert_anchor_or_seen_at_from_status(
     update: &mut TxUpdate<ConfirmationBlockTime>,
     start_time: u64,
@@ -61,6 +63,7 @@ fn insert_anchor_or_seen_at_from_status(
 
 /// Inserts floating txouts into `tx_graph` using [`Vin`](esplora_client::api::Vin)s returned by
 /// Esplora.
+#[allow(dead_code)]
 fn insert_prevouts(
     update: &mut TxUpdate<ConfirmationBlockTime>,
     esplora_inputs: impl IntoIterator<Item = esplora_client::api::Vin>,

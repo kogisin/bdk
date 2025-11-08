@@ -55,8 +55,8 @@ where
     /// # Errors
     ///
     /// If the prefixed bytes of the loaded file do not match the provided `magic`, a
-    /// [`StoreErrorWithDump`] will be returned with the [`StoreError::InvalidMagicBytes`] error variant in
-    /// its error field and changeset field set to [`Option::None`]
+    /// [`StoreErrorWithDump`] will be returned with the [`StoreError::InvalidMagicBytes`] error
+    /// variant in its error field and changeset field set to [`Option::None`]
     ///
     /// If there exist changesets in the file, [`load`] will try to aggregate them in
     /// a single changeset to verify their integrity. If aggregation fails
@@ -118,7 +118,7 @@ where
     ///             let mut new_store =
     ///                 Store::create(&MAGIC_BYTES, &new_file_path).expect("must create new file");
     ///             if let Some(aggregated_changeset) = changeset {
-    ///                 new_store.append(&aggregated_changeset)?;
+    ///                 new_store.append(aggregated_changeset.as_ref())?;
     ///             }
     ///             // The following will overwrite the original file. You will loose the corrupted
     ///             // portion of the original file forever.
@@ -152,7 +152,7 @@ where
         f.read_exact(&mut magic_buf)?;
         if magic_buf != magic {
             return Err(StoreErrorWithDump {
-                changeset: Option::<C>::None,
+                changeset: Option::<Box<C>>::None,
                 error: StoreError::InvalidMagicBytes {
                     got: magic_buf,
                     expected: magic.to_vec(),
@@ -194,7 +194,7 @@ where
                     Ok(aggregated_changeset)
                 }
                 Err(iter_error) => Err(StoreErrorWithDump {
-                    changeset: aggregated_changeset,
+                    changeset: aggregated_changeset.map(Box::new),
                     error: iter_error,
                 }),
             },
@@ -220,7 +220,7 @@ where
             Self::create(magic, file_path)
                 .map(|store| (store, Option::<C>::None))
                 .map_err(|err: StoreError| StoreErrorWithDump {
-                    changeset: Option::<C>::None,
+                    changeset: Option::<Box<C>>::None,
                     error: err,
                 })
         }
@@ -246,7 +246,7 @@ where
             .serialize_into(&mut self.db_file, changeset)
             .map_err(|e| match *e {
                 bincode::ErrorKind::Io(error) => error,
-                unexpected_err => panic!("unexpected bincode error: {}", unexpected_err),
+                unexpected_err => panic!("unexpected bincode error: {unexpected_err}"),
             })?;
 
         Ok(())
@@ -257,7 +257,7 @@ where
 #[derive(Debug)]
 pub struct StoreErrorWithDump<C> {
     /// The partially-aggregated changeset.
-    pub changeset: Option<C>,
+    pub changeset: Option<Box<C>>,
 
     /// The [`StoreError`]
     pub error: StoreError,
@@ -266,7 +266,7 @@ pub struct StoreErrorWithDump<C> {
 impl<C> From<io::Error> for StoreErrorWithDump<C> {
     fn from(value: io::Error) -> Self {
         Self {
-            changeset: Option::<C>::None,
+            changeset: Option::<Box<C>>::None,
             error: StoreError::Io(value),
         }
     }
@@ -281,6 +281,7 @@ impl<C> std::fmt::Display for StoreErrorWithDump<C> {
 impl<C: fmt::Debug> std::error::Error for StoreErrorWithDump<C> {}
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod test {
     use super::*;
 
@@ -323,7 +324,7 @@ mod test {
                 error: StoreError::Io(e),
                 ..
             }) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
-            unexpected => panic!("unexpected result: {:?}", unexpected),
+            unexpected => panic!("unexpected result: {unexpected:?}"),
         };
     }
 
@@ -342,7 +343,7 @@ mod test {
             }) => {
                 assert_eq!(got, invalid_magic_bytes.as_bytes())
             }
-            unexpected => panic!("unexpected result: {:?}", unexpected),
+            unexpected => panic!("unexpected result: {unexpected:?}"),
         };
     }
 
@@ -370,9 +371,9 @@ mod test {
                 changeset,
                 error: StoreError::Bincode(_),
             }) => {
-                assert_eq!(changeset, Some(test_changesets))
+                assert_eq!(changeset, Some(Box::new(test_changesets)))
             }
-            unexpected_res => panic!("unexpected result: {:?}", unexpected_res),
+            unexpected_res => panic!("unexpected result: {unexpected_res:?}"),
         }
     }
 
@@ -398,9 +399,9 @@ mod test {
                 changeset,
                 error: StoreError::Bincode(_),
             }) => {
-                assert_eq!(changeset, Some(test_changesets))
+                assert_eq!(changeset, Some(Box::new(test_changesets)))
             }
-            unexpected_res => panic!("unexpected result: {:?}", unexpected_res),
+            unexpected_res => panic!("unexpected result: {unexpected_res:?}"),
         }
     }
 
@@ -476,7 +477,7 @@ mod test {
         let last_changeset_bytes = bincode_options().serialize(&last_changeset).unwrap();
 
         for short_write_len in 1..last_changeset_bytes.len() - 1 {
-            let file_path = temp_dir.path().join(format!("{}.dat", short_write_len));
+            let file_path = temp_dir.path().join(format!("{short_write_len}.dat"));
 
             // simulate creating a file, writing data where the last write is incomplete
             {
@@ -499,10 +500,14 @@ mod test {
                     .expect_err("should fail to aggregate");
                 assert_eq!(
                     err.changeset,
-                    changesets.iter().cloned().reduce(|mut acc, cs| {
-                        Merge::merge(&mut acc, cs);
-                        acc
-                    }),
+                    changesets
+                        .iter()
+                        .cloned()
+                        .reduce(|mut acc, cs| {
+                            Merge::merge(&mut acc, cs);
+                            acc
+                        })
+                        .map(Box::new),
                     "should recover all changesets that are written in full",
                 );
                 // Remove file and start again

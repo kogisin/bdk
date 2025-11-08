@@ -3,9 +3,9 @@
 #[macro_use]
 mod common;
 
-use bdk_chain::{Balance, BlockId};
+use bdk_chain::{local_chain::LocalChain, Balance, BlockId};
 use bdk_testenv::{block_id, hash, local_chain};
-use bitcoin::{Amount, OutPoint, ScriptBuf};
+use bitcoin::{Amount, BlockHash, OutPoint};
 use common::*;
 use std::collections::{BTreeSet, HashSet};
 
@@ -32,7 +32,7 @@ struct Scenario<'a> {
 #[test]
 fn test_tx_conflict_handling() {
     // Create Local chains
-    let local_chain = local_chain!(
+    let local_chain: LocalChain<BlockHash> = local_chain!(
         (0, hash!("A")),
         (1, hash!("B")),
         (2, hash!("C")),
@@ -59,11 +59,12 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(1))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "unconfirmed_conflict",
                     inputs: &[
-                        TxInTemplate::PrevTx("confirmed_genesis", 0), 
+                        TxInTemplate::PrevTx("confirmed_genesis", 0),
                         TxInTemplate::PrevTx("unconfirmed_coinbase", 0)
                     ],
                     outputs: &[TxOutTemplate::new(20000, Some(2))],
@@ -130,6 +131,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(0)), TxOutTemplate::new(10000, Some(1))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "tx_conflict_1",
@@ -165,6 +167,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(0))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "tx_conflict_1",
@@ -207,6 +210,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(0))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "tx_conflict_1",
@@ -221,6 +225,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(30000, Some(2))],
                     anchors: &[block_id!(4, "Orphaned Block")],
                     last_seen: Some(300),
+                    ..Default::default()
                 },
             ],
             exp_chain_txs: HashSet::from(["tx1", "tx_orphaned_conflict"]),
@@ -242,6 +247,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(0))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "tx_conflict_1",
@@ -256,6 +262,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(30000, Some(2))],
                     anchors: &[block_id!(4, "Orphaned Block")],
                     last_seen: Some(100),
+                    ..Default::default()
                 },
             ],
             exp_chain_txs: HashSet::from(["tx1", "tx_conflict_1"]),
@@ -277,6 +284,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(0))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "tx_conflict_1",
@@ -371,6 +379,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(0))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "B",
@@ -459,6 +468,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(0))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "B",
@@ -504,6 +514,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(0))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "B",
@@ -549,6 +560,7 @@ fn test_tx_conflict_handling() {
                     outputs: &[TxOutTemplate::new(10000, Some(0))],
                     anchors: &[block_id!(1, "B")],
                     last_seen: None,
+                    ..Default::default()
                 },
                 TxTemplate {
                     tx_name: "B",
@@ -686,20 +698,288 @@ fn test_tx_conflict_handling() {
             exp_chain_txouts: HashSet::from([("tx", 0)]),
             exp_unspents: HashSet::from([("tx", 0)]),
             exp_balance: Balance { trusted_pending: Amount::from_sat(9000), ..Default::default() }
+        },
+        Scenario {
+            name: "tx spends from 2 conflicting transactions where a conflict spends another",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "A",
+                    inputs: &[TxInTemplate::Bogus],
+                    outputs: &[TxOutTemplate::new(10_000, None)],
+                    last_seen: Some(1),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "S1",
+                    inputs: &[TxInTemplate::PrevTx("A", 0)],
+                    outputs: &[TxOutTemplate::new(9_000, None)],
+                    last_seen: Some(2),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "S2",
+                    inputs: &[TxInTemplate::PrevTx("A", 0), TxInTemplate::PrevTx("S1", 0)],
+                    outputs: &[TxOutTemplate::new(17_000, None)],
+                    last_seen: Some(3),
+                    ..Default::default()
+                },
+            ],
+            exp_chain_txs: HashSet::from(["A", "S1"]),
+            exp_chain_txouts: HashSet::from([]),
+            exp_unspents: HashSet::from([]),
+            exp_balance: Balance::default(),
+        },
+        Scenario {
+            name: "tx spends from 2 conflicting transactions where the conflict is nested",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "A",
+                    inputs: &[TxInTemplate::Bogus],
+                    outputs: &[TxOutTemplate::new(10_000, Some(0))],
+                    last_seen: Some(1),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "S1",
+                    inputs: &[TxInTemplate::PrevTx("A", 0)],
+                    outputs: &[TxOutTemplate::new(9_000, Some(0))],
+                    last_seen: Some(3),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "B",
+                    inputs: &[TxInTemplate::PrevTx("S1", 0)],
+                    outputs: &[TxOutTemplate::new(8_000, Some(0))],
+                    last_seen: Some(2),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "S2",
+                    inputs: &[TxInTemplate::PrevTx("B", 0), TxInTemplate::PrevTx("A", 0)],
+                    outputs: &[TxOutTemplate::new(17_000, Some(0))],
+                    last_seen: Some(4),
+                    ..Default::default()
+                },
+            ],
+            exp_chain_txs: HashSet::from(["A", "S1", "B"]),
+            exp_chain_txouts: HashSet::from([("A", 0), ("B", 0), ("S1", 0)]),
+            exp_unspents: HashSet::from([("B", 0)]),
+            exp_balance: Balance { trusted_pending: Amount::from_sat(8_000), ..Default::default() },
+        },
+        Scenario {
+            name: "tx spends from 2 conflicting transactions where the conflict is nested (different last_seens)",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "A",
+                    inputs: &[TxInTemplate::Bogus],
+                    outputs: &[TxOutTemplate::new(10_000, Some(0))],
+                    last_seen: Some(1),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "S1",
+                    inputs: &[TxInTemplate::PrevTx("A", 0)],
+                    outputs: &[TxOutTemplate::new(9_000, Some(0))],
+                    last_seen: Some(4),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "B",
+                    inputs: &[TxInTemplate::PrevTx("S1", 0)],
+                    outputs: &[TxOutTemplate::new(8_000, Some(0))],
+                    last_seen: Some(2),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "S2",
+                    inputs: &[TxInTemplate::PrevTx("A", 0), TxInTemplate::PrevTx("B", 0)],
+                    outputs: &[TxOutTemplate::new(17_000, Some(0))],
+                    last_seen: Some(3),
+                    ..Default::default()
+                },
+            ],
+            exp_chain_txs: HashSet::from(["A", "S1", "B"]),
+            exp_chain_txouts: HashSet::from([("A", 0), ("B", 0), ("S1", 0)]),
+            exp_unspents: HashSet::from([("B", 0)]),
+            exp_balance: Balance { trusted_pending: Amount::from_sat(8_000), ..Default::default() },
+        },
+        Scenario {
+            name: "assume-canonical-tx displaces unconfirmed chain",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "root",
+                    inputs: &[TxInTemplate::Bogus],
+                    outputs: &[
+                        TxOutTemplate::new(21_000, Some(0)),
+                        TxOutTemplate::new(21_000, Some(1)),
+                    ],
+                    anchors: &[block_id!(1, "B")],
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "unconfirmed",
+                    inputs: &[TxInTemplate::PrevTx("root", 0)],
+                    outputs: &[TxOutTemplate::new(20_000, Some(1))],
+                    last_seen: Some(2),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "unconfirmed_descendant",
+                    inputs: &[
+                        TxInTemplate::PrevTx("unconfirmed", 0),
+                        TxInTemplate::PrevTx("root", 1),
+                    ],
+                    outputs: &[TxOutTemplate::new(28_000, Some(2))],
+                    last_seen: Some(2),
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "assume_canonical",
+                    inputs: &[TxInTemplate::PrevTx("root", 0)],
+                    outputs: &[TxOutTemplate::new(19_000, Some(3))],
+                    assume_canonical: true,
+                    ..Default::default()
+                },
+            ],
+            exp_chain_txs: HashSet::from(["root", "assume_canonical"]),
+            exp_chain_txouts: HashSet::from([("root", 0), ("root", 1), ("assume_canonical", 0)]),
+            exp_unspents: HashSet::from([("root", 1), ("assume_canonical", 0)]),
+            exp_balance: Balance {
+                immature: Amount::ZERO,
+                trusted_pending: Amount::from_sat(19_000),
+                untrusted_pending: Amount::ZERO,
+                confirmed: Amount::from_sat(21_000),
+            },
+        },
+        Scenario {
+            name: "assume-canonical-tx displaces confirmed chain",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "root",
+                    inputs: &[TxInTemplate::Bogus],
+                    outputs: &[
+                        TxOutTemplate::new(21_000, Some(0)),
+                        TxOutTemplate::new(21_000, Some(1)),
+                    ],
+                    anchors: &[block_id!(1, "B")],
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "confirmed",
+                    inputs: &[TxInTemplate::PrevTx("root", 0)],
+                    outputs: &[TxOutTemplate::new(20_000, Some(1))],
+                    anchors: &[block_id!(2, "C")],
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "confirmed_descendant",
+                    inputs: &[
+                        TxInTemplate::PrevTx("confirmed", 0),
+                        TxInTemplate::PrevTx("root", 1),
+                    ],
+                    outputs: &[TxOutTemplate::new(28_000, Some(2))],
+                    anchors: &[block_id!(3, "D")],
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "assume_canonical",
+                    inputs: &[TxInTemplate::PrevTx("root", 0)],
+                    outputs: &[TxOutTemplate::new(19_000, Some(3))],
+                    assume_canonical: true,
+                    ..Default::default()
+                },
+            ],
+            exp_chain_txs: HashSet::from(["root", "assume_canonical"]),
+            exp_chain_txouts: HashSet::from([("root", 0), ("root", 1), ("assume_canonical", 0)]),
+            exp_unspents: HashSet::from([("root", 1), ("assume_canonical", 0)]),
+            exp_balance: Balance {
+                immature: Amount::ZERO,
+                trusted_pending: Amount::from_sat(19_000),
+                untrusted_pending: Amount::ZERO,
+                confirmed: Amount::from_sat(21_000),
+            },
+        },
+        Scenario {
+            name: "assume-canonical txs respects order",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "root",
+                    inputs: &[TxInTemplate::Bogus],
+                    outputs: &[
+                        TxOutTemplate::new(21_000, Some(0)),
+                    ],
+                    anchors: &[block_id!(1, "B")],
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "assume_a",
+                    inputs: &[TxInTemplate::PrevTx("root", 0)],
+                    outputs: &[TxOutTemplate::new(20_000, Some(1))],
+                    assume_canonical: true,
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "assume_b",
+                    inputs: &[TxInTemplate::PrevTx("root", 0)],
+                    outputs: &[TxOutTemplate::new(19_000, Some(1))],
+                    assume_canonical: true,
+                    ..Default::default()
+                },
+                TxTemplate {
+                    tx_name: "assume_c",
+                    inputs: &[TxInTemplate::PrevTx("root", 0)],
+                    outputs: &[TxOutTemplate::new(18_000, Some(1))],
+                    assume_canonical: true,
+                    ..Default::default()
+                },
+            ],
+            exp_chain_txs: HashSet::from(["root", "assume_c"]),
+            exp_chain_txouts: HashSet::from([("root", 0), ("assume_c", 0)]),
+            exp_unspents: HashSet::from([("assume_c", 0)]),
+            exp_balance: Balance {
+                immature: Amount::ZERO,
+                trusted_pending: Amount::from_sat(18_000),
+                untrusted_pending: Amount::ZERO,
+                confirmed: Amount::ZERO,
+            },
+        },
+        Scenario {
+            name: "coinbase tx must not become unconfirmed",
+            tx_templates: &[
+                TxTemplate {
+                    tx_name: "coinbase",
+                    inputs: &[TxInTemplate::Coinbase],
+                    outputs: &[TxOutTemplate::new(21_000, Some(0))],
+                    // Stale block
+                    anchors: &[block_id!(1, "B-prime")],
+                    ..Default::default()
+                }
+            ],
+            exp_chain_txs: HashSet::from([]),
+            exp_chain_txouts: HashSet::from([]),
+            exp_unspents: HashSet::from([]),
+            exp_balance: Balance {
+                immature: Amount::ZERO,
+                trusted_pending: Amount::ZERO,
+                untrusted_pending: Amount::ZERO,
+                confirmed: Amount::ZERO,
+            }
         }
     ];
 
     for scenario in scenarios {
-        let (tx_graph, spk_index, exp_tx_ids) = init_graph(scenario.tx_templates.iter());
+        let env = init_graph(scenario.tx_templates.iter());
 
-        let txs = tx_graph
-            .list_canonical_txs(&local_chain, chain_tip)
-            .map(|tx| tx.tx_node.txid)
+        let txs = env
+            .tx_graph
+            .canonical_view(&local_chain, chain_tip, env.canonicalization_params.clone())
+            .txs()
+            .map(|tx| tx.txid)
             .collect::<BTreeSet<_>>();
         let exp_txs = scenario
             .exp_chain_txs
             .iter()
-            .map(|txid| *exp_tx_ids.get(txid).expect("txid must exist"))
+            .map(|txid| *env.txid_to_name.get(txid).expect("txid must exist"))
             .collect::<BTreeSet<_>>();
         assert_eq!(
             txs, exp_txs,
@@ -707,19 +987,17 @@ fn test_tx_conflict_handling() {
             scenario.name
         );
 
-        let txouts = tx_graph
-            .filter_chain_txouts(
-                &local_chain,
-                chain_tip,
-                spk_index.outpoints().iter().cloned(),
-            )
+        let txouts = env
+            .tx_graph
+            .canonical_view(&local_chain, chain_tip, env.canonicalization_params.clone())
+            .filter_outpoints(env.indexer.outpoints().iter().cloned())
             .map(|(_, full_txout)| full_txout.outpoint)
             .collect::<BTreeSet<_>>();
         let exp_txouts = scenario
             .exp_chain_txouts
             .iter()
             .map(|(txid, vout)| OutPoint {
-                txid: *exp_tx_ids.get(txid).expect("txid must exist"),
+                txid: *env.txid_to_name.get(txid).expect("txid must exist"),
                 vout: *vout,
             })
             .collect::<BTreeSet<_>>();
@@ -729,19 +1007,17 @@ fn test_tx_conflict_handling() {
             scenario.name
         );
 
-        let utxos = tx_graph
-            .filter_chain_unspents(
-                &local_chain,
-                chain_tip,
-                spk_index.outpoints().iter().cloned(),
-            )
+        let utxos = env
+            .tx_graph
+            .canonical_view(&local_chain, chain_tip, env.canonicalization_params.clone())
+            .filter_unspent_outpoints(env.indexer.outpoints().iter().cloned())
             .map(|(_, full_txout)| full_txout.outpoint)
             .collect::<BTreeSet<_>>();
         let exp_utxos = scenario
             .exp_unspents
             .iter()
             .map(|(txid, vout)| OutPoint {
-                txid: *exp_tx_ids.get(txid).expect("txid must exist"),
+                txid: *env.txid_to_name.get(txid).expect("txid must exist"),
                 vout: *vout,
             })
             .collect::<BTreeSet<_>>();
@@ -751,12 +1027,18 @@ fn test_tx_conflict_handling() {
             scenario.name
         );
 
-        let balance = tx_graph.balance(
-            &local_chain,
-            chain_tip,
-            spk_index.outpoints().iter().cloned(),
-            |_, spk: ScriptBuf| spk_index.index_of_spk(spk).is_some(),
-        );
+        let balance = env
+            .tx_graph
+            .canonical_view(&local_chain, chain_tip, env.canonicalization_params.clone())
+            .balance(
+                env.indexer.outpoints().iter().cloned(),
+                |_, txout| {
+                    env.indexer
+                        .index_of_spk(txout.txout.script_pubkey.as_script())
+                        .is_some()
+                },
+                0,
+            );
         assert_eq!(
             balance, scenario.exp_balance,
             "\n[{}] 'balance' failed",

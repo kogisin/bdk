@@ -30,7 +30,7 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let client = Builder::new(base_url.as_str()).build_blocking();
 
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new(SpkTxOutIndex::<()>::default());
-    let (chain, _) = LocalChain::from_genesis_hash(env.bitcoind.client.get_block_hash(0)?);
+    let (chain, _) = LocalChain::from_genesis(env.bitcoind.client.get_block_hash(0)?);
 
     // Get receiving address.
     let receiver_spk = common::get_test_spk();
@@ -87,7 +87,11 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let sync_request = SyncRequest::builder()
         .chain_tip(chain.tip())
         .spks_with_indexes(graph.index.all_spks().clone())
-        .expected_spk_txids(graph.list_expected_spk_txids(&chain, chain.tip().block_id(), ..));
+        .expected_spk_txids(
+            graph
+                .canonical_view(&chain, chain.tip().block_id(), Default::default())
+                .list_expected_spk_txids(&graph.index, ..),
+        );
     let sync_response = client.sync(sync_request, 1)?;
     assert!(
         sync_response
@@ -112,7 +116,11 @@ pub fn detect_receive_tx_cancel() -> anyhow::Result<()> {
     let sync_request = SyncRequest::builder()
         .chain_tip(chain.tip())
         .spks_with_indexes(graph.index.all_spks().clone())
-        .expected_spk_txids(graph.list_expected_spk_txids(&chain, chain.tip().block_id(), ..));
+        .expected_spk_txids(
+            graph
+                .canonical_view(&chain, chain.tip().block_id(), Default::default())
+                .list_expected_spk_txids(&graph.index, ..),
+        );
     let sync_response = client.sync(sync_request, 1)?;
     assert!(
         sync_response

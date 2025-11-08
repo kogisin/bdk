@@ -8,7 +8,7 @@ use bdk_chain::{
     bitcoin::Network,
     keychain_txout::FullScanRequestBuilderExt,
     spk_client::{FullScanRequest, SyncRequest},
-    Merge,
+    CanonicalizationParams, Merge,
 };
 use bdk_esplora::{esplora_client, EsploraExt};
 use example_cli::{
@@ -153,9 +153,9 @@ fn main() -> anyhow::Result<()> {
                         let mut once = BTreeSet::<Keychain>::new();
                         move |keychain, spk_i, _| {
                             if once.insert(keychain) {
-                                eprint!("\nscanning {}: ", keychain);
+                                eprint!("\nscanning {keychain}: ");
                             }
-                            eprint!("{} ", spk_i);
+                            eprint!("{spk_i} ");
                             // Flush early to ensure we print at every iteration.
                             let _ = io::stderr().flush();
                         }
@@ -215,7 +215,7 @@ fn main() -> anyhow::Result<()> {
                     .chain_tip(local_tip.clone())
                     .inspect(|item, progress| {
                         let pc = (100 * progress.consumed()) as f32 / progress.total() as f32;
-                        eprintln!("[ SCANNING {:03.0}% ] {}", pc, item);
+                        eprintln!("[ SCANNING {pc:03.0}% ] {item}");
                         // Flush early to ensure we print at every iteration.
                         let _ = io::stderr().flush();
                     });
@@ -225,11 +225,14 @@ fn main() -> anyhow::Result<()> {
             {
                 let graph = graph.lock().unwrap();
                 let chain = chain.lock().unwrap();
-                request = request.expected_spk_txids(graph.list_expected_spk_txids(
+                let canonical_view = graph.canonical_view(
                     &*chain,
                     local_tip.block_id(),
-                    ..,
-                ));
+                    CanonicalizationParams::default(),
+                );
+
+                request = request
+                    .expected_spk_txids(canonical_view.list_expected_spk_txids(&graph.index, ..));
                 if *all_spks {
                     request = request.spks_with_indexes(graph.index.revealed_spks(..));
                 }
@@ -242,13 +245,8 @@ fn main() -> anyhow::Result<()> {
                     // `EsploraExt::update_tx_graph_without_keychain`.
                     let init_outpoints = graph.index.outpoints();
                     request = request.outpoints(
-                        graph
-                            .graph()
-                            .filter_chain_unspents(
-                                &*chain,
-                                local_tip.block_id(),
-                                init_outpoints.iter().cloned(),
-                            )
+                        canonical_view
+                            .filter_unspent_outpoints(init_outpoints.iter().cloned())
                             .map(|(_, utxo)| utxo.outpoint),
                     );
                 };
@@ -257,11 +255,10 @@ fn main() -> anyhow::Result<()> {
                     // We provide the unconfirmed txids to
                     // `EsploraExt::update_tx_graph_without_keychain`.
                     request = request.txids(
-                        graph
-                            .graph()
-                            .list_canonical_txs(&*chain, local_tip.block_id())
-                            .filter(|canonical_tx| !canonical_tx.chain_position.is_confirmed())
-                            .map(|canonical_tx| canonical_tx.tx_node.txid),
+                        canonical_view
+                            .txs()
+                            .filter(|canonical_tx| !canonical_tx.pos.is_confirmed())
+                            .map(|canonical_tx| canonical_tx.txid),
                     );
                 }
             }

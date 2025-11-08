@@ -5,7 +5,7 @@ use bdk_chain::{
     collections::BTreeSet,
     indexed_tx_graph,
     spk_client::{FullScanRequest, SyncRequest},
-    ConfirmationBlockTime, Merge,
+    CanonicalizationParams, ConfirmationBlockTime, Merge,
 };
 use bdk_electrum::{
     electrum_client::{self, Client, ElectrumApi},
@@ -65,8 +65,8 @@ impl ElectrumCommands {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct ElectrumArgs {
-    /// The electrum url to use to connect to. If not provided it will use a default electrum server
-    /// for your chosen network.
+    /// The electrum url to use to connect to. If not provided it will use a default electrum
+    /// server for your chosen network.
     electrum_url: Option<String>,
 }
 
@@ -126,15 +126,13 @@ fn main() -> anyhow::Result<()> {
 
     let client = BdkElectrumClient::new(electrum_cmd.electrum_args().client(network)?);
 
-    // Tell the electrum client about the txs we've already got locally so it doesn't re-download them
-    client.populate_tx_cache(
-        graph
-            .lock()
-            .unwrap()
-            .graph()
-            .full_txs()
-            .map(|tx_node| tx_node.tx),
-    );
+    // Tell the electrum client about the txs and anchors we've already got locally so it doesn't
+    // re-download .them
+    {
+        let graph = graph.lock().unwrap();
+        client.populate_tx_cache(graph.graph().full_txs().map(|tx_node| tx_node.tx));
+        client.populate_anchor_cache(graph.graph().all_anchors().clone());
+    }
 
     let (chain_update, tx_update, keychain_update) = match electrum_cmd.clone() {
         ElectrumCommands::Scan {
@@ -168,9 +166,9 @@ fn main() -> anyhow::Result<()> {
                         let mut once = BTreeSet::new();
                         move |k, spk_i, _| {
                             if once.insert(k) {
-                                eprint!("\nScanning {}: {} ", k, spk_i);
+                                eprint!("\nScanning {k}: {spk_i} ");
                             } else {
-                                eprint!("{} ", spk_i);
+                                eprint!("{spk_i} ");
                             }
                             io::stdout().flush().expect("must flush");
                         }
@@ -212,14 +210,17 @@ fn main() -> anyhow::Result<()> {
                     .chain_tip(chain_tip.clone())
                     .inspect(|item, progress| {
                         let pc = (100 * progress.consumed()) as f32 / progress.total() as f32;
-                        eprintln!("[ SCANNING {:03.0}% ] {}", pc, item);
+                        eprintln!("[ SCANNING {pc:03.0}% ] {item}");
                     });
 
-            request = request.expected_spk_txids(graph.list_expected_spk_txids(
+            let canonical_view = graph.canonical_view(
                 &*chain,
                 chain_tip.block_id(),
-                ..,
-            ));
+                CanonicalizationParams::default(),
+            );
+
+            request = request
+                .expected_spk_txids(canonical_view.list_expected_spk_txids(&graph.index, ..));
             if all_spks {
                 request = request.spks_with_indexes(graph.index.revealed_spks(..));
             }
@@ -229,23 +230,17 @@ fn main() -> anyhow::Result<()> {
             if utxos {
                 let init_outpoints = graph.index.outpoints();
                 request = request.outpoints(
-                    graph
-                        .graph()
-                        .filter_chain_unspents(
-                            &*chain,
-                            chain_tip.block_id(),
-                            init_outpoints.iter().cloned(),
-                        )
+                    canonical_view
+                        .filter_unspent_outpoints(init_outpoints.iter().cloned())
                         .map(|(_, utxo)| utxo.outpoint),
                 );
             };
             if unconfirmed {
                 request = request.txids(
-                    graph
-                        .graph()
-                        .list_canonical_txs(&*chain, chain_tip.block_id())
-                        .filter(|canonical_tx| !canonical_tx.chain_position.is_confirmed())
-                        .map(|canonical_tx| canonical_tx.tx_node.txid),
+                    canonical_view
+                        .txs()
+                        .filter(|canonical_tx| !canonical_tx.pos.is_confirmed())
+                        .map(|canonical_tx| canonical_tx.txid),
                 );
             }
 
